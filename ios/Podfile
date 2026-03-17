@@ -1,9 +1,13 @@
+# Ligne indispensable pour que CocoaPods comprenne les commandes Flutter
+load File.join(File.dirname(File.realpath(__FILE__)), 'Flutter', 'generated_plugin_registrant.rb')
+
 platform :ios, '15.0'
 
 target 'Runner' do
   use_frameworks!
   use_modular_headers!
 
+  # Cette ligne utilise maintenant le lien chargé plus haut
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
 end
 
