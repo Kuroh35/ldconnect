@@ -1,0 +1,45 @@
+# Codemagic – Build Android + iOS
+# Répertoire de travail : racine du projet (là où se trouve pubspec.yaml)
+
+workflows:
+  ld-connect-android-ios:
+    name: LD Connect (Android + iOS)
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Dépendances Flutter
+        script: |
+          flutter pub get
+      - name: Build Android (APK debug/test)
+        script: |
+          flutter build apk --release
+      - name: Build iOS (sans codesign pour test)
+        script: |
+          # Générer les artefacts iOS (dont generated_plugin_registrant.rb) avant pod install
+          flutter pub get
+          flutter build ios --release --no-codesign
+    artifacts:
+      - build/**/outputs/**/*.apk
+      - build/ios/ipa/*.ipa
+    publishing:
+      scripts:
+        - name: Publier artefacts
+          script: |
+            echo "Build Android et iOS terminés. Voir les artefacts."
+  ios-only:
+    name: iOS uniquement
+    max_build_duration: 45
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Dépendances et build iOS
+        script: |
+          flutter pub get
+          flutter build ios --release --no-codesign
+    artifacts:
+      - build/ios/ipa/*.ipa
