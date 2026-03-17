@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "411777862788",
+    "project_id": "ld-connect-c1972",
+    "storage_bucket": "ld-connect-c1972.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:411777862788:android:d526b9e94df23bd1d146d1",
+        "android_client_info": {
+          "package_name": "com.example.ld_connect"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDC2j3aWgLvM4tIjBEXRLoYWkPKT2lShr0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
