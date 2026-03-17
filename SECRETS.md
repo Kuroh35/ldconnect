@@ -35,7 +35,7 @@ firebase deploy --only functions
 
 | Config | Rôle |
 |--------|------|
-| `brevo.api_key` | Clé API Brevo (emails de vérification) |
+| `brevo.api_key` | Clé API Brevo (envoi du code de vérification par la Cloud Function) |
 | `discord.reports_webhook` | Webhook Discord pour les reports |
 | `discord.bans_webhook` | Webhook Discord pour les bans/unbans |
 | `discord.bugs_webhook` | Webhook Discord pour les bugs signalés |

@@ -1,6 +1,8 @@
 import * as functions from "firebase-functions/v1";
 import * as admin from "firebase-admin";
+import * as dotenv from "dotenv";
 
+dotenv.config();
 admin.initializeApp();
 
 export const sendUserNotification = functions.firestore
@@ -99,9 +101,6 @@ export const sendUserNotification = functions.firestore
     await admin.messaging().sendEachForMulticast(payload);
   });
 
-// Secrets lus via Firebase Config (pas de clés en dur dans le repo)
-// Voir SECRETS.md pour configurer : firebase functions:config:set ...
-
 export const sendVerificationEmail = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Non authentifié.");
@@ -111,13 +110,12 @@ export const sendVerificationEmail = functions.https.onCall(async (data, context
   if (!email || !code) {
     throw new functions.https.HttpsError("invalid-argument", "email et code requis");
   }
-  let apiKey: string | undefined;
-  try {
-    const config = (functions as any).config?.() ?? {};
-    apiKey = config.brevo?.api_key as string | undefined;
-  } catch {
-    apiKey = undefined;
-  }
+  // Priorité :
+  // 1) .env / variables d'environnement (local)
+  // 2) firebase functions:config:set brevo.api_key="..." (prod)
+  const apiKey =
+    process.env.BREVO_API_KEY ||
+    ((functions as any).config?.()?.brevo?.api_key as string | undefined);
   if (!apiKey) {
     throw new functions.https.HttpsError("failed-precondition", "Brevo non configuré");
   }

@@ -3,6 +3,9 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui';
+
+import 'package:image/image.dart' as img;
+import 'package:image_cropper/image_cropper.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_functions/cloud_functions.dart';
@@ -26,6 +29,78 @@ const AndroidNotificationChannel _defaultNotificationChannel =
   description: 'Notifications importantes LD Connect',
   importance: Importance.high,
 );
+
+/// Sélectionne et recadre une image (PP ou bannière). L'utilisateur peut zoomer/déplacer pour choisir la zone.
+Future<File?> pickAndCropImage(
+  BuildContext context, {
+  required double aspectRatioX,
+  required double aspectRatioY,
+  bool circular = false,
+  int maxWidth = 1024,
+  int maxHeight = 1024,
+}) async {
+  final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+  if (picked == null || !context.mounted) return null;
+  final cropped = await ImageCropper().cropImage(
+    sourcePath: picked.path,
+    aspectRatio: CropAspectRatio(ratioX: aspectRatioX, ratioY: aspectRatioY),
+    uiSettings: [
+      AndroidUiSettings(
+        toolbarTitle: circular ? "Recadrer la photo" : "Recadrer la bannière",
+        toolbarColor: const Color(0xFF1E1C33),
+        toolbarWidgetColor: Colors.white,
+        cropStyle: circular ? CropStyle.circle : CropStyle.rectangle,
+        lockAspectRatio: true,
+      ),
+      IOSUiSettings(
+        title: circular ? "Recadrer la photo" : "Recadrer la bannière",
+        cropStyle: circular ? CropStyle.circle : CropStyle.rectangle,
+        aspectRatioLockEnabled: true,
+      ),
+    ],
+    compressQuality: 85,
+    maxWidth: maxWidth,
+    maxHeight: maxHeight,
+  );
+  if (cropped == null) return null;
+  return File(cropped.path);
+}
+
+/// Redimensionne une image (PP ou bannière) pour limiter taille et poids.
+Future<File?> resizeImageForUpload(
+  File source, {
+  int maxWidth = 512,
+  int maxHeight = 512,
+  int quality = 85,
+}) async {
+  try {
+    final bytes = await source.readAsBytes();
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) return null;
+    final needResize =
+        decoded.width > maxWidth || decoded.height > maxHeight;
+    img.Image resized = decoded;
+    if (needResize) {
+      if (decoded.width > decoded.height) {
+        resized = img.copyResize(decoded, width: maxWidth);
+      } else {
+        resized = img.copyResize(decoded, height: maxHeight);
+      }
+      if (resized.height > maxHeight) {
+        resized = img.copyResize(resized, height: maxHeight);
+      }
+      if (resized.width > maxWidth) {
+        resized = img.copyResize(resized, width: maxWidth);
+      }
+    }
+    final out = img.encodeJpg(resized, quality: quality);
+    final tmp = File('${source.path}_resized.jpg');
+    await tmp.writeAsBytes(out);
+    return tmp;
+  } catch (_) {
+    return null;
+  }
+}
 
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
@@ -434,7 +509,6 @@ class _AuthScreenState extends State<AuthScreen>
     with SingleTickerProviderStateMixin {
   final TextEditingController _email = TextEditingController();
   final TextEditingController _pass = TextEditingController();
-  final TextEditingController _referralController = TextEditingController();
   bool isLogin = true;
   bool isLoading = false;
   bool rememberMe = false;
@@ -460,7 +534,6 @@ class _AuthScreenState extends State<AuthScreen>
     _logoAnimController.dispose();
     _email.dispose();
     _pass.dispose();
-    _referralController.dispose();
     super.dispose();
   }
 
@@ -495,11 +568,109 @@ class _AuthScreenState extends State<AuthScreen>
     UserCredential? userCredential;
     try {
       if (isLogin) {
-        userCredential =
-            await FirebaseAuth.instance.signInWithEmailAndPassword(
-          email: _email.text.trim(),
-          password: _pass.text.trim(),
-        );
+        try {
+          userCredential =
+              await FirebaseAuth.instance.signInWithEmailAndPassword(
+            email: _email.text.trim(),
+            password: _pass.text.trim(),
+          );
+        } on FirebaseAuthMultiFactorException catch (e) {
+          final resolver = e.resolver;
+          final hints = resolver.hints;
+          if (hints.isEmpty) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Vérification 2FA requise. Aucun facteur disponible.")),
+              );
+            }
+            return;
+          }
+          final hint = hints.first;
+          if (hint is! PhoneMultiFactorInfo) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Seul la 2FA par SMS est supportée.")),
+              );
+            }
+            return;
+          }
+          final mfaCompleter = Completer<UserCredential?>();
+          FirebaseAuth.instance.verifyPhoneNumber(
+            multiFactorSession: resolver.session,
+            multiFactorInfo: hint,
+            verificationCompleted: (cred) async {
+              try {
+                final uc = await resolver.resolveSignIn(
+                  PhoneMultiFactorGenerator.getAssertion(cred),
+                );
+                if (!mfaCompleter.isCompleted) mfaCompleter.complete(uc);
+              } catch (_) {
+                if (!mfaCompleter.isCompleted) mfaCompleter.complete(null);
+              }
+            },
+            verificationFailed: (err) {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text(err.message ?? "Échec 2FA")),
+                );
+              }
+              if (!mfaCompleter.isCompleted) mfaCompleter.complete(null);
+            },
+            codeSent: (String vid, int? _) async {
+              if (!mounted) return;
+              final codeCtrl = TextEditingController();
+              final codeOk = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text("Code de vérification"),
+                  content: TextField(
+                    controller: codeCtrl,
+                    decoration: const InputDecoration(
+                      labelText: "Code SMS à 6 chiffres",
+                    ),
+                    keyboardType: TextInputType.number,
+                    maxLength: 6,
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx, false),
+                      child: const Text("Annuler"),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx, true),
+                      child: const Text("Valider"),
+                    ),
+                  ],
+                ),
+              );
+              if (codeOk != true || !mounted || mfaCompleter.isCompleted) return;
+              final code = codeCtrl.text.trim();
+              if (code.isEmpty) {
+                mfaCompleter.complete(null);
+                return;
+              }
+              try {
+                final credential = PhoneAuthProvider.credential(
+                  verificationId: vid,
+                  smsCode: code,
+                );
+                final uc = await resolver.resolveSignIn(
+                  PhoneMultiFactorGenerator.getAssertion(credential),
+                );
+                if (!mfaCompleter.isCompleted) mfaCompleter.complete(uc);
+              } catch (_) {
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text("Code invalide.")),
+                );
+                if (!mfaCompleter.isCompleted) mfaCompleter.complete(null);
+              }
+            },
+            codeAutoRetrievalTimeout: (_) {},
+          );
+          userCredential = await mfaCompleter.future;
+          if (userCredential == null) return;
+        }
 
         // Après connexion, on s'assure que le profil Firestore existe
         // et on redirige vers le bon écran (vérif / setup / app).
@@ -540,8 +711,7 @@ class _AuthScreenState extends State<AuthScreen>
 
             if (!isVerified) {
               final email = (data['email'] ?? user.email ?? '').toString();
-              final storedCode =
-                  (data['verificationCode'] ?? '').toString();
+              final storedCode = (data['verificationCode'] ?? '').toString();
               Navigator.pushReplacement(
                 context,
                 MaterialPageRoute(
@@ -569,7 +739,7 @@ class _AuthScreenState extends State<AuthScreen>
           }
         }
       } else {
-        // Inscription + envoi du mail Brevo
+        // Inscription + envoi du code par Brevo (Cloud Function, clé API dans Firebase Config)
         String code = (100000 + Random().nextInt(899999)).toString();
         userCredential = await FirebaseAuth.instance
             .createUserWithEmailAndPassword(
@@ -584,27 +754,7 @@ class _AuthScreenState extends State<AuthScreen>
           'code': code,
         });
 
-        // Génération code de parrainage
-        String referralCode = _generateReferralCode();
         final userId = userCredential.user!.uid;
-
-        // Gestion parrain éventuel
-        String? referredBy;
-        final referralText = _referralController.text.trim();
-        if (referralText.isNotEmpty) {
-          final query = await FirebaseFirestore.instance
-              .collection('users')
-              .where('referralCode', isEqualTo: referralText)
-              .limit(1)
-              .get();
-          if (query.docs.isNotEmpty) {
-            referredBy = query.docs.first.id;
-            // incrémente le compteur du parrain
-            await query.docs.first.reference.update({
-              'referralCount': FieldValue.increment(1),
-            });
-          }
-        }
 
         await FirebaseFirestore.instance
             .collection('users')
@@ -619,9 +769,6 @@ class _AuthScreenState extends State<AuthScreen>
               'setupDone': false,
               'isVerified': false,
               'verificationCode': code,
-              'referralCode': referralCode,
-              if (referredBy != null) 'referredBy': referredBy,
-              'referralCount': 0,
             });
 
         if (mounted) {
@@ -656,12 +803,6 @@ class _AuthScreenState extends State<AuthScreen>
     } finally {
       if (mounted) setState(() => isLoading = false);
     }
-  }
-
-  String _generateReferralCode() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    final rand = Random();
-    return List.generate(6, (_) => chars[rand.nextInt(chars.length)]).join();
   }
 
   @override
@@ -745,14 +886,6 @@ class _AuthScreenState extends State<AuthScreen>
                   ],
                 ),
                 if (!isLogin) ...[
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _referralController,
-                    decoration: NeonTheme.inputStyle(
-                      "Code de parrainage (optionnel)",
-                      icon: Icons.card_giftcard,
-                    ),
-                  ),
                   const SizedBox(height: 8),
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -853,6 +986,7 @@ class _AuthScreenState extends State<AuthScreen>
   }
 }
 
+/// Écran de vérification par code à 6 chiffres (envoyé par Brevo via Cloud Function).
 class VerificationCodeScreen extends StatelessWidget {
   final String email;
   final String initialCode;
@@ -1029,10 +1163,15 @@ class _SetupProfileScreenState extends State<SetupProfileScreen> {
                 Center(
                   child: GestureDetector(
                     onTap: () async {
-                      final p = await ImagePicker().pickImage(
-                        source: ImageSource.gallery,
+                      final f = await pickAndCropImage(
+                        context,
+                        aspectRatioX: 1,
+                        aspectRatioY: 1,
+                        circular: true,
+                        maxWidth: 512,
+                        maxHeight: 512,
                       );
-                      if (p != null) setState(() => _img = File(p.path));
+                      if (f != null && mounted) setState(() => _img = f);
                     },
                     child: CircleAvatar(
                       radius: 70,
@@ -1353,6 +1492,265 @@ class _ProfileAvatarBar extends StatelessWidget {
   }
 }
 
+/// Écran de configuration de la double authentification (2FA).
+class TwoFactorSettingsScreen extends StatefulWidget {
+  const TwoFactorSettingsScreen({super.key});
+
+  @override
+  State<TwoFactorSettingsScreen> createState() => _TwoFactorSettingsScreenState();
+}
+
+class _TwoFactorSettingsScreenState extends State<TwoFactorSettingsScreen> {
+  bool _loading = false;
+  String? _error;
+
+  Future<void> _enrollSms2FA() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || user.email == null || user.email!.isEmpty) {
+      setState(() => _error = "Un compte avec email vérifié est requis.");
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final session = await user.multiFactor.getSession();
+      final phoneCtrl = TextEditingController();
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: NeonTheme.surface2,
+          title: const Text("Activer la 2FA (SMS)"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                "Entre ton numéro de téléphone. Tu recevras un code par SMS à chaque connexion.",
+                style: TextStyle(color: Colors.white70),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: phoneCtrl,
+                decoration: const InputDecoration(
+                  labelText: "Numéro (ex: +33612345678)",
+                  hintText: "+33...",
+                ),
+                keyboardType: TextInputType.phone,
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text("Annuler"),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text("Envoyer le code"),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) {
+        setState(() => _loading = false);
+        return;
+      }
+      final phone = phoneCtrl.text.trim();
+      if (phone.isEmpty) {
+        setState(() {
+          _loading = false;
+          _error = "Numéro requis.";
+        });
+        return;
+      }
+      final completer = Completer<bool>();
+      String? vid;
+      FirebaseAuth.instance.verifyPhoneNumber(
+        multiFactorSession: session,
+        phoneNumber: phone,
+        verificationCompleted: (_) {},
+        verificationFailed: (e) {
+          if (!completer.isCompleted) {
+            completer.completeError(e);
+          }
+        },
+        codeSent: (String verificationId, int? _) async {
+          vid = verificationId;
+          if (!mounted) return;
+          final codeCtrl = TextEditingController();
+          final codeOk = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              backgroundColor: NeonTheme.surface2,
+              title: const Text("Code SMS"),
+              content: TextField(
+                controller: codeCtrl,
+                decoration: const InputDecoration(
+                  labelText: "Code à 6 chiffres reçu par SMS",
+                ),
+                keyboardType: TextInputType.number,
+                maxLength: 6,
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text("Annuler"),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: const Text("Valider"),
+                ),
+              ],
+            ),
+          );
+          if (codeOk != true || vid == null || !mounted) {
+            completer.complete(false);
+            return;
+          }
+          final code = codeCtrl.text.trim();
+          if (code.isEmpty) {
+            completer.complete(false);
+            return;
+          }
+          try {
+            final credential = PhoneAuthProvider.credential(
+              verificationId: vid!,
+              smsCode: code,
+            );
+            await user.multiFactor.enroll(
+              PhoneMultiFactorGenerator.getAssertion(credential),
+              displayName: "SMS",
+            );
+            if (!completer.isCompleted) completer.complete(true);
+          } catch (e) {
+            if (!completer.isCompleted) completer.completeError(e);
+          }
+        },
+        codeAutoRetrievalTimeout: (_) {},
+      );
+      bool ok = false;
+      try {
+        ok = await completer.future;
+      } catch (e) {
+        if (mounted) setState(() {
+          _loading = false;
+          _error = e is FirebaseAuthException ? (e.message ?? e.code) : e.toString();
+        });
+        return;
+      }
+      if (!mounted) return;
+      setState(() => _loading = false);
+      if (ok) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Double authentification activée.")),
+        );
+        Navigator.pop(context);
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) setState(() {
+        _loading = false;
+        _error = e.message ?? e.code;
+      });
+    } catch (e) {
+      if (mounted) setState(() {
+        _loading = false;
+        _error = e.toString();
+      });
+    }
+    if (mounted) setState(() => _loading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Double authentification"),
+        backgroundColor: Colors.transparent,
+        foregroundColor: Colors.white,
+      ),
+      body: Container(
+        decoration: NeonTheme.galaxyBgConnected(),
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _NeonCard(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: FutureBuilder<List<MultiFactorInfo>>(
+                      future: user != null
+                          ? user.multiFactor.getEnrolledFactors()
+                          : Future.value(<MultiFactorInfo>[]),
+                      builder: (context, snap) {
+                        final hasMFA = (snap.data?.length ?? 0) > 0;
+                        return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              hasMFA ? Icons.check_circle : Icons.security,
+                              color: hasMFA ? Colors.green : NeonTheme.neonBlue,
+                              size: 32,
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Text(
+                                hasMFA
+                                    ? "La double authentification est activée."
+                                    : "Protège ton compte avec une vérification en deux étapes.",
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 16,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (_error != null) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            _error!,
+                            style: const TextStyle(color: Colors.redAccent),
+                          ),
+                        ],
+                        if (!hasMFA) ...[
+                          const SizedBox(height: 16),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              onPressed: _loading ? null : _enrollSms2FA,
+                              icon: _loading
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                    )
+                                  : const Icon(Icons.sms),
+                              label: Text(_loading ? "En cours…" : "Activer la 2FA (SMS)"),
+                            ),
+                          ),
+                        ],
+                      ],
+                    );
+                      },
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// Onglet Paramètres (engrenage) : Déconnexion + à configurer plus tard.
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -1444,6 +1842,26 @@ class SettingsScreen extends StatelessWidget {
               child: const ListTile(
                 leading: Icon(Icons.description, color: Colors.white),
                 title: Text("Conditions d’utilisation"),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          _NeonCard(
+            child: InkWell(
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const TwoFactorSettingsScreen(),
+                ),
+              ),
+              borderRadius: BorderRadius.circular(18),
+              child: const ListTile(
+                leading: Icon(Icons.security, color: Colors.white),
+                title: Text("Double authentification (2FA)"),
+                subtitle: Text(
+                  "Sécurise ton compte avec une seconde vérification",
+                  style: TextStyle(color: Colors.white70, fontSize: 12),
+                ),
               ),
             ),
           ),
@@ -7402,6 +7820,7 @@ class _CreatePostSheetContentState extends State<_CreatePostSheetContent> {
   File? _selectedMedia;
   String? _mediaType;
   String _visibility = 'friends'; // 'friends', 'public', 'private'
+  bool _publishing = false;
 
   Future<void> _pickImage() async {
     final picked =
@@ -7514,72 +7933,84 @@ class _CreatePostSheetContentState extends State<_CreatePostSheetContent> {
   }
 
   Future<void> _publish() async {
+    if (_publishing) return;
     final text = _controller.text.trim();
     if (text.isEmpty && _selectedMedia == null) return;
 
-    final postsRef = FirebaseFirestore.instance.collection('posts');
-    final newDoc = postsRef.doc();
-
-    String? mediaUrl;
-    String? mediaTypeToSave = _mediaType;
-
-    if (_selectedMedia != null && mediaTypeToSave != null) {
-      final fileName =
-          "${newDoc.id}.${mediaTypeToSave == 'image' ? 'jpg' : 'mp4'}";
-      final ref = FirebaseStorage.instance
-          .ref()
-          .child('posts_media/$fileName');
-      await ref.putFile(_selectedMedia!);
-      mediaUrl = await ref.getDownloadURL();
-    }
-
-    await newDoc.set({
-      'text': text,
-      'authorId': widget.currentUid,
-      'authorName': widget.currentName,
-      'authorAvatar': widget.currentAvatar,
-      'timestamp': FieldValue.serverTimestamp(),
-      'likesCount': 0,
-      'commentsCount': 0,
-      'likedBy': <String>[],
-      'mediaUrl': mediaUrl,
-      'mediaType': mediaTypeToSave,
-      'visibility': _visibility,
-    });
-
-    // XP pour création de post
-    await _awardXp(widget.currentUid, 20);
-
-    // Notifications pour les abonnés (follow) quand un nouveau post est publié
+    setState(() => _publishing = true);
     try {
-      final followersSnap = await FirebaseFirestore.instance
-          .collection('follows')
-          .where('targetId', isEqualTo: widget.currentUid)
-          .get();
-      for (final doc in followersSnap.docs) {
-        final data = doc.data() as Map<String, dynamic>;
-        final followerId = (data['followerId'] ?? '').toString();
-        if (followerId.isEmpty || followerId == widget.currentUid) continue;
-        await FirebaseFirestore.instance
-            .collection('users')
-            .doc(followerId)
-            .collection('notifications')
-            .add({
-          'type': 'follow_post',
-          'message': "${widget.currentName} a publié un nouveau post",
-          'postId': newDoc.id,
-          'commentId': null,
-          'fromUserId': widget.currentUid,
-          'timestamp': FieldValue.serverTimestamp(),
-          'read': false,
-        });
-      }
-    } catch (_) {
-      // En cas d'erreur sur les notifs de followers, on ne bloque pas la publication.
-    }
+      final postsRef = FirebaseFirestore.instance.collection('posts');
+      final newDoc = postsRef.doc();
 
-    await widget.onNotifyMentions?.call(text, newDoc.id);
-    if (mounted) Navigator.pop(context);
+      String? mediaUrl;
+      String? mediaTypeToSave = _mediaType;
+
+      if (_selectedMedia != null && mediaTypeToSave != null) {
+        final fileName =
+            "${newDoc.id}.${mediaTypeToSave == 'image' ? 'jpg' : 'mp4'}";
+        final ref = FirebaseStorage.instance
+            .ref()
+            .child('posts_media/$fileName');
+        await ref.putFile(_selectedMedia!);
+        mediaUrl = await ref.getDownloadURL();
+      }
+
+      await newDoc.set({
+        'text': text,
+        'authorId': widget.currentUid,
+        'authorName': widget.currentName,
+        'authorAvatar': widget.currentAvatar,
+        'timestamp': FieldValue.serverTimestamp(),
+        'likesCount': 0,
+        'commentsCount': 0,
+        'likedBy': <String>[],
+        'mediaUrl': mediaUrl,
+        'mediaType': mediaTypeToSave,
+        'visibility': _visibility,
+      });
+
+      // XP pour création de post
+      await _awardXp(widget.currentUid, 20);
+
+      // Notifications pour les abonnés (follow) quand un nouveau post est publié
+      try {
+        final followersSnap = await FirebaseFirestore.instance
+            .collection('follows')
+            .where('targetId', isEqualTo: widget.currentUid)
+            .get();
+        for (final doc in followersSnap.docs) {
+          final data = doc.data() as Map<String, dynamic>;
+          final followerId = (data['followerId'] ?? '').toString();
+          if (followerId.isEmpty || followerId == widget.currentUid) continue;
+          await FirebaseFirestore.instance
+              .collection('users')
+              .doc(followerId)
+              .collection('notifications')
+              .add({
+            'type': 'follow_post',
+            'message': "${widget.currentName} a publié un nouveau post",
+            'postId': newDoc.id,
+            'commentId': null,
+            'fromUserId': widget.currentUid,
+            'timestamp': FieldValue.serverTimestamp(),
+            'read': false,
+          });
+        }
+      } catch (_) {
+        // En cas d'erreur sur les notifs de followers, on ne bloque pas la publication.
+      }
+
+      await widget.onNotifyMentions?.call(text, newDoc.id);
+      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Erreur lors de la publication: $e")),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _publishing = false);
+    }
   }
 
   @override
@@ -7726,8 +8157,21 @@ class _CreatePostSheetContentState extends State<_CreatePostSheetContent> {
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
-                  onPressed: _publish,
-                  child: const Text("Publier"),
+                  onPressed: _publishing ? null : _publish,
+                  child: _publishing
+                      ? const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(width: 12),
+                            Text("Envoi en cours..."),
+                          ],
+                        )
+                      : const Text("Publier"),
                 ),
               ),
             ],
@@ -8665,6 +9109,40 @@ class _CommentsSheetState extends State<CommentsSheet> {
                                     style: TextStyle(fontSize: 12),
                                   ),
                                 ),
+                                if (authorId == currentUid)
+                                  TextButton(
+                                    onPressed: () => _deleteComment(doc.id),
+                                    style: TextButton.styleFrom(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
+                                      ),
+                                      minimumSize: const Size(0, 20),
+                                    ),
+                                    child: const Text(
+                                      "Supprimer",
+                                      style: TextStyle(fontSize: 12, color: Colors.redAccent),
+                                    ),
+                                  ),
+                                TextButton(
+                                  onPressed: () => openReportDialog(
+                                    context: context,
+                                    type: 'report_comment',
+                                    postId: widget.postId,
+                                    commentId: doc.id,
+                                    reportedUserId: authorId,
+                                    reportedUserName: authorName,
+                                  ),
+                                  style: TextButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                    ),
+                                    minimumSize: const Size(0, 20),
+                                  ),
+                                  child: const Text(
+                                    "Signaler",
+                                    style: TextStyle(fontSize: 12, color: Colors.orange),
+                                  ),
+                                ),
                               ],
                             ),
                           ],
@@ -8704,30 +9182,79 @@ class _CommentsSheetState extends State<CommentsSheet> {
                   ],
                 ),
               ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _controller,
-                      decoration: NeonTheme.inputStyle(
-                        "Ajouter un commentaire",
+            SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _controller,
+                        decoration: NeonTheme.inputStyle(
+                          "Ajouter un commentaire",
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton(
-                    icon: const Icon(Icons.send, color: NeonTheme.neonBlue),
-                    onPressed: () => _send(currentUid),
-                  ),
-                ],
+                    const SizedBox(width: 8),
+                    IconButton(
+                      icon: const Icon(Icons.send, color: NeonTheme.neonBlue),
+                      onPressed: () => _send(currentUid),
+                    ),
+                  ],
+                ),
               ),
             ),
           ],
         ),
       ),
     );
+  }
+
+  Future<void> _deleteComment(String commentId) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Supprimer le commentaire ?"),
+        content: const Text(
+          "Cette action est irréversible.",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("Annuler"),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text("Supprimer", style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await FirebaseFirestore.instance
+          .collection('posts')
+          .doc(widget.postId)
+          .collection('comments')
+          .doc(commentId)
+          .delete();
+      await FirebaseFirestore.instance
+          .collection('posts')
+          .doc(widget.postId)
+          .update({'commentsCount': FieldValue.increment(-1)});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Commentaire supprimé.")),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Erreur: $e")),
+        );
+      }
+    }
   }
 
   Future<void> _toggleCommentLike({
@@ -8945,18 +9472,58 @@ class NotificationsSheet extends StatelessWidget {
               ),
             ),
           ),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 18),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                "Notifications",
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.white,
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 18),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  "Notifications",
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
                 ),
-              ),
+                TextButton(
+                  onPressed: () async {
+                    final ok = await showDialog<bool>(
+                      context: context,
+                      builder: (ctx) => AlertDialog(
+                        title: const Text("Tout supprimer ?"),
+                        content: const Text(
+                          "Supprimer toutes les notifications ?",
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(ctx, false),
+                            child: const Text("Annuler"),
+                          ),
+                          TextButton(
+                            onPressed: () => Navigator.pop(ctx, true),
+                            child: const Text("Supprimer", style: TextStyle(color: Colors.red)),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (ok != true) return;
+                    final snap = await FirebaseFirestore.instance
+                        .collection('users')
+                        .doc(userId)
+                        .collection('notifications')
+                        .get();
+                    for (final doc in snap.docs) {
+                      await doc.reference.delete();
+                    }
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text("Toutes les notifications ont été supprimées.")),
+                      );
+                    }
+                  },
+                  child: const Text("Tout supprimer", style: TextStyle(fontSize: 12)),
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 8),
@@ -9045,13 +9612,29 @@ class NotificationsSheet extends StatelessWidget {
                                 ),
                               )
                             : null,
-                        trailing: read
-                            ? null
-                            : const Icon(
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (!read)
+                              const Icon(
                                 Icons.brightness_1,
                                 size: 10,
                                 color: NeonTheme.accent,
                               ),
+                            const SizedBox(width: 8),
+                            IconButton(
+                              icon: const Icon(Icons.delete_outline, size: 18, color: Colors.white54),
+                              onPressed: () async {
+                                await doc.reference.delete();
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(content: Text("Notification supprimée.")),
+                                  );
+                                }
+                              },
+                            ),
+                          ],
+                        ),
                         onTap: () async {
                           await doc.reference.update({'read': true});
                         },
@@ -9139,13 +9722,27 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   }
 
   Future<void> _pickAvatar() async {
-    final p = await ImagePicker().pickImage(source: ImageSource.gallery);
-    if (p != null) setState(() => _avatarFile = File(p.path));
+    final f = await pickAndCropImage(
+      context,
+      aspectRatioX: 1,
+      aspectRatioY: 1,
+      circular: true,
+      maxWidth: 512,
+      maxHeight: 512,
+    );
+    if (f != null && mounted) setState(() => _avatarFile = f);
   }
 
   Future<void> _pickBanner() async {
-    final p = await ImagePicker().pickImage(source: ImageSource.gallery);
-    if (p != null) setState(() => _bannerFile = File(p.path));
+    final f = await pickAndCropImage(
+      context,
+      aspectRatioX: 3,
+      aspectRatioY: 1,
+      circular: false,
+      maxWidth: 1200,
+      maxHeight: 400,
+    );
+    if (f != null && mounted) setState(() => _bannerFile = f);
   }
 
   Future<void> _save() async {
@@ -9685,72 +10282,6 @@ class UserProfileScreen extends StatelessWidget {
                               ],
                             ),
                           const SizedBox(height: 12),
-                          if ((u['referralCode'] ?? '').toString().isNotEmpty)
-                            _NeonCard(
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 14,
-                                  vertical: 10,
-                                ),
-                                child: Row(
-                                  children: [
-                                    const Icon(
-                                      Icons.card_giftcard,
-                                      color: NeonTheme.neonBlue,
-                                    ),
-                                    const SizedBox(width: 10),
-                                    Expanded(
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          const Text(
-                                            "Mon code de parrainage",
-                                            style: TextStyle(
-                                              color: Colors.white70,
-                                              fontSize: 12,
-                                              fontWeight: FontWeight.w600,
-                                            ),
-                                          ),
-                                          const SizedBox(height: 2),
-                                          Text(
-                                            (u['referralCode'] ?? '')
-                                                .toString(),
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                              fontSize: 16,
-                                              fontWeight: FontWeight.w700,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                    IconButton(
-                                      icon: const Icon(
-                                        Icons.copy,
-                                        color: Colors.white70,
-                                      ),
-                                      onPressed: () async {
-                                        final code = (u['referralCode'] ?? '')
-                                            .toString();
-                                        await Clipboard.setData(
-                                          ClipboardData(text: code),
-                                        );
-                                        ScaffoldMessenger.of(context)
-                                            .showSnackBar(
-                                          SnackBar(
-                                            content: Text(
-                                              "Code $code copié dans le presse‑papiers",
-                                            ),
-                                          ),
-                                        );
-                                      },
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          const SizedBox(height: 16),
                           Row(
                             children: [
                               Expanded(
