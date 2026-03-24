@@ -222,36 +222,51 @@ Future<void> _awardXp(String userId, int amount) async {
   });
 }
 
+/// FCM + notifications locales : ne doit pas bloquer [runApp], sinon écran blanc
+/// (souvent sur iOS / sideload ou si `getToken()` attend indéfiniment).
+Future<void> _setupMessagingAndNotifications() async {
+  try {
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const iosInit = DarwinInitializationSettings();
+    const initSettings = InitializationSettings(
+      android: androidInit,
+      iOS: iosInit,
+    );
+    await flutterLocalNotificationsPlugin.initialize(settings: initSettings);
+    await flutterLocalNotificationsPlugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.createNotificationChannel(_defaultNotificationChannel);
+
+    final messaging = FirebaseMessaging.instance;
+    await messaging.requestPermission();
+    final token = await messaging.getToken().timeout(
+      const Duration(seconds: 25),
+      onTimeout: () => null,
+    );
+    debugPrint('FCM token: $token');
+    await saveFcmTokenToUser(token);
+
+    messaging.onTokenRefresh.listen((newToken) async {
+      debugPrint('FCM token refresh: $newToken');
+      await saveFcmTokenToUser(newToken);
+    });
+
+    FirebaseMessaging.onMessage.listen(_firebaseOnMessageHandler);
+  } catch (e, st) {
+    debugPrint('FCM / notifications init failed: $e\n$st');
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
-
-  const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
-  const initSettings = InitializationSettings(android: androidInit);
-  await flutterLocalNotificationsPlugin.initialize(
-    settings: initSettings,
-  );
-  await flutterLocalNotificationsPlugin
-      .resolvePlatformSpecificImplementation<
-          AndroidFlutterLocalNotificationsPlugin>()
-      ?.createNotificationChannel(_defaultNotificationChannel);
-
+  // Doit être enregistré avant runApp (recommandation Firebase).
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
-  final messaging = FirebaseMessaging.instance;
-  await messaging.requestPermission();
-  final token = await messaging.getToken();
-  debugPrint('FCM token: $token');
-  await saveFcmTokenToUser(token);
-
-  messaging.onTokenRefresh.listen((newToken) async {
-    debugPrint('FCM token refresh: $newToken');
-    await saveFcmTokenToUser(newToken);
-  });
-
-  FirebaseMessaging.onMessage.listen(_firebaseOnMessageHandler);
-
+  // Démarre l'UI tout de suite ; FCM en arrière-plan (évite écran blanc si getToken bloque).
   runApp(const LDConnectApp());
+  unawaited(_setupMessagingAndNotifications());
 
   // XP passif pour temps d'utilisation : petite récompense toutes les 5 minutes
   Timer.periodic(const Duration(minutes: 5), (timer) async {
@@ -1025,19 +1040,23 @@ class VerificationCodeScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 30),
                   ElevatedButton(
-                    onPressed: () {
-                      if (inputCtrl.text == initialCode) {
-                        FirebaseFirestore.instance
-                            .collection('users')
-                            .doc(FirebaseAuth.instance.currentUser!.uid)
-                            .update({'isVerified': true});
+                    onPressed: () async {
+                      final code = inputCtrl.text.trim();
+                      if (code.isEmpty) return;
+                      try {
+                        final callable = FirebaseFunctions.instance
+                            .httpsCallable('verifyEmailCode');
+                        await callable.call({'code': code});
+
+                        if (!context.mounted) return;
                         Navigator.pushReplacement(
                           context,
                           MaterialPageRoute(
                             builder: (context) => const SetupProfileScreen(),
                           ),
                         );
-                      } else {
+                      } catch (_) {
+                        if (!context.mounted) return;
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(content: Text("Code incorrect")),
                         );

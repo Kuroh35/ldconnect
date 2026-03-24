@@ -137,6 +137,38 @@ export const sendVerificationEmail = functions.https.onCall(async (data, context
   return { ok: true };
 });
 
+export const verifyEmailCode = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "Non authentifié.");
+  }
+  const code = (data?.code as string | undefined)?.trim();
+  if (!code) {
+    throw new functions.https.HttpsError("invalid-argument", "code requis");
+  }
+
+  const uid = context.auth.uid;
+  const userRef = admin.firestore().collection("users").doc(uid);
+  const snap = await userRef.get();
+  if (!snap.exists) {
+    throw new functions.https.HttpsError("not-found", "Profil introuvable");
+  }
+  const u = snap.data() as any;
+  const stored = (u?.verificationCode as string | undefined) ?? "";
+  if (!stored || stored !== code) {
+    throw new functions.https.HttpsError("permission-denied", "Code incorrect");
+  }
+
+  await Promise.all([
+    userRef.update({
+      isVerified: true,
+      verificationCode: admin.firestore.FieldValue.delete(),
+    }),
+    admin.auth().updateUser(uid, { emailVerified: true }),
+  ]);
+
+  return { ok: true };
+});
+
 export const onReportCreated = functions.firestore
   .document("reports/{reportId}")
   .onCreate(async (snap, context) => {
