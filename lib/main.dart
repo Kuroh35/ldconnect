@@ -258,9 +258,50 @@ Future<void> _setupMessagingAndNotifications() async {
   }
 }
 
+/// Premier écran si Firebase ne démarre pas (bundle ID / plist / réseau).
+Widget _firebaseInitErrorScreen(Object error) {
+  return MaterialApp(
+    debugShowCheckedModeBanner: false,
+    home: Scaffold(
+      backgroundColor: const Color(0xFF030315),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Center(
+            child: Text(
+              'Impossible d’initialiser Firebase.\n\n'
+              'Vérifie la connexion, que le Bundle ID correspond à '
+              'GoogleService-Info.plist, puis réinstalle l’app.\n\n'
+              '$error',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
+
+  Object? firebaseInitError;
+  try {
+    await Firebase.initializeApp().timeout(
+      const Duration(seconds: 25),
+      onTimeout: () => throw TimeoutException('Firebase.initializeApp()'),
+    );
+  } catch (e, st) {
+    firebaseInitError = e;
+    debugPrint('Firebase init failed: $e\n$st');
+  }
+
+  if (firebaseInitError != null) {
+    runApp(_firebaseInitErrorScreen(firebaseInitError));
+    return;
+  }
+
   // Doit être enregistré avant runApp (recommandation Firebase).
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
@@ -379,16 +420,34 @@ class LDConnectApp extends StatelessWidget {
         primaryColor: NeonTheme.accent,
       ),
       home: StreamBuilder<User?>(
-        stream: FirebaseAuth.instance.authStateChanges(),
+        stream: FirebaseAuth.instance.authStateChanges().timeout(
+          const Duration(seconds: 20),
+          onTimeout: (sink) => sink.add(null),
+        ),
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Scaffold(
-              body: Center(child: CircularProgressIndicator()),
+            return Scaffold(
+              backgroundColor: NeonTheme.bgDark,
+              body: const Center(
+                child: CircularProgressIndicator(color: Colors.white),
+              ),
             );
           }
 
           if (snapshot.hasError) {
-            return const AuthScreen();
+            return Scaffold(
+              backgroundColor: NeonTheme.bgDark,
+              body: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    'Erreur auth: ${snapshot.error}',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                ),
+              ),
+            );
           }
 
           final user = snapshot.data;
@@ -400,11 +459,31 @@ class LDConnectApp extends StatelessWidget {
             future: FirebaseFirestore.instance
                 .collection('users')
                 .doc(user.uid)
-                .get(),
+                .get()
+                .timeout(const Duration(seconds: 20)),
             builder: (context, userDocSnap) {
               if (userDocSnap.connectionState == ConnectionState.waiting) {
-                return const Scaffold(
-                  body: Center(child: CircularProgressIndicator()),
+                return Scaffold(
+                  backgroundColor: NeonTheme.bgDark,
+                  body: const Center(
+                    child: CircularProgressIndicator(color: Colors.white),
+                  ),
+                );
+              }
+
+              if (userDocSnap.hasError) {
+                return Scaffold(
+                  backgroundColor: NeonTheme.bgDark,
+                  body: Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Text(
+                        'Erreur chargement profil: ${userDocSnap.error}',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                    ),
+                  ),
                 );
               }
 
