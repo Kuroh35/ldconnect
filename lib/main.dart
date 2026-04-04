@@ -1800,9 +1800,9 @@ class _TwoFactorSettingsScreenState extends State<TwoFactorSettingsScreen> {
       _loading = true;
       _error = null;
     });
+    final phoneCtrl = TextEditingController();
     try {
       final session = await user.multiFactor.getSession();
-      final phoneCtrl = TextEditingController();
       final confirmed = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
@@ -1852,77 +1852,113 @@ class _TwoFactorSettingsScreenState extends State<TwoFactorSettingsScreen> {
       }
       final completer = Completer<bool>();
       String? vid;
+
+      void safeComplete(bool value) {
+        if (!completer.isCompleted) completer.complete(value);
+      }
+
+      void safeCompleteError(Object e) {
+        if (!completer.isCompleted) completer.completeError(e);
+      }
+
       FirebaseAuth.instance.verifyPhoneNumber(
         multiFactorSession: session,
         phoneNumber: phone,
-        verificationCompleted: (_) {},
-        verificationFailed: (e) {
-          if (!completer.isCompleted) {
-            completer.completeError(e);
-          }
-        },
-        codeSent: (String verificationId, int? _) async {
-          vid = verificationId;
-          if (!mounted) return;
-          final codeCtrl = TextEditingController();
-          final codeOk = await showDialog<bool>(
-            context: context,
-            builder: (ctx) => AlertDialog(
-              backgroundColor: NeonTheme.surface2,
-              title: const Text("Code SMS"),
-              content: TextField(
-                controller: codeCtrl,
-                decoration: const InputDecoration(
-                  labelText: "Code à 6 chiffres reçu par SMS",
-                ),
-                keyboardType: TextInputType.number,
-                maxLength: 6,
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx, false),
-                  child: const Text("Annuler"),
-                ),
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx, true),
-                  child: const Text("Valider"),
-                ),
-              ],
-            ),
-          );
-          if (codeOk != true || vid == null || !mounted) {
-            completer.complete(false);
-            return;
-          }
-          final code = codeCtrl.text.trim();
-          if (code.isEmpty) {
-            completer.complete(false);
-            return;
-          }
+        verificationCompleted: (PhoneAuthCredential credential) async {
+          if (completer.isCompleted) return;
           try {
-            final credential = PhoneAuthProvider.credential(
-              verificationId: vid!,
-              smsCode: code,
-            );
             await user.multiFactor.enroll(
               PhoneMultiFactorGenerator.getAssertion(credential),
               displayName: "SMS",
             );
-            if (!completer.isCompleted) completer.complete(true);
+            safeComplete(true);
           } catch (e) {
-            if (!completer.isCompleted) completer.completeError(e);
+            safeCompleteError(e);
+          }
+        },
+        verificationFailed: (e) {
+          safeCompleteError(e);
+        },
+        codeSent: (String verificationId, int? _) async {
+          if (completer.isCompleted) return;
+          vid = verificationId;
+          if (!mounted) {
+            safeComplete(false);
+            return;
+          }
+          final codeCtrl = TextEditingController();
+          try {
+            final codeOk = await showDialog<bool>(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                backgroundColor: NeonTheme.surface2,
+                title: const Text("Code SMS"),
+                content: TextField(
+                  controller: codeCtrl,
+                  decoration: const InputDecoration(
+                    labelText: "Code à 6 chiffres reçu par SMS",
+                  ),
+                  keyboardType: TextInputType.number,
+                  maxLength: 6,
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: const Text("Annuler"),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    child: const Text("Valider"),
+                  ),
+                ],
+              ),
+            );
+            if (codeOk != true || vid == null || !mounted) {
+              safeComplete(false);
+              return;
+            }
+            final code = codeCtrl.text.trim();
+            if (code.isEmpty) {
+              safeComplete(false);
+              return;
+            }
+            try {
+              final credential = PhoneAuthProvider.credential(
+                verificationId: vid!,
+                smsCode: code,
+              );
+              await user.multiFactor.enroll(
+                PhoneMultiFactorGenerator.getAssertion(credential),
+                displayName: "SMS",
+              );
+              safeComplete(true);
+            } catch (e) {
+              safeCompleteError(e);
+            }
+          } finally {
+            codeCtrl.dispose();
           }
         },
         codeAutoRetrievalTimeout: (_) {},
       );
       bool ok = false;
       try {
-        ok = await completer.future;
+        ok = await completer.future.timeout(
+          const Duration(minutes: 3),
+          onTimeout: () {
+            safeComplete(false);
+            return false;
+          },
+        );
       } catch (e) {
-        if (mounted) setState(() {
-          _loading = false;
-          _error = e is FirebaseAuthException ? (e.message ?? e.code) : e.toString();
-        });
+        if (mounted) {
+          setState(() {
+            _loading = false;
+            _error = e is FirebaseAuthException
+                ? (e.message ?? e.code)
+                : e.toString();
+          });
+        }
         return;
       }
       if (!mounted) return;
@@ -1943,6 +1979,8 @@ class _TwoFactorSettingsScreenState extends State<TwoFactorSettingsScreen> {
         _loading = false;
         _error = e.toString();
       });
+    } finally {
+      phoneCtrl.dispose();
     }
     if (mounted) setState(() => _loading = false);
   }
@@ -6061,6 +6099,25 @@ class _ConversationTile extends StatelessWidget {
     required this.onTap,
   });
 
+  void _openProfile(BuildContext context) {
+    final currentUid = FirebaseAuth.instance.currentUser?.uid;
+    if (otherId == currentUid) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => const UserProfileScreen(),
+        ),
+      );
+    } else {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PublicProfileScreen(userId: otherId),
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
@@ -6068,107 +6125,97 @@ class _ConversationTile extends StatelessWidget {
       child: _NeonCard(
         child: Padding(
           padding: const EdgeInsets.all(14),
-          child: Row(
-            children: [
-              GestureDetector(
-                onTap: () {
-                  final currentUid = FirebaseAuth.instance.currentUser?.uid;
-                  if (otherId == currentUid) {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const UserProfileScreen(),
-                      ),
-                    );
-                  } else {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => PublicProfileScreen(userId: otherId),
-                      ),
-                    );
-                  }
-                },
-                child: FutureBuilder<DocumentSnapshot>(
-                  future: FirebaseFirestore.instance
-                      .collection('users')
-                      .doc(otherId)
-                      .get(),
-                  builder: (context, snap) {
-                    String? avatarUrl;
-                    if (snap.hasData &&
-                        snap.data!.exists &&
-                        snap.data!.data() != null) {
-                      final data =
-                          snap.data!.data() as Map<String, dynamic>? ?? {};
-                      avatarUrl = data['avatarUrl'] as String?;
-                    }
-                    return CircleAvatar(
+          child: FutureBuilder<DocumentSnapshot>(
+            future: FirebaseFirestore.instance
+                .collection('users')
+                .doc(otherId)
+                .get(),
+            builder: (context, snap) {
+              String? avatarUrl;
+              var displayName = otherName.trim();
+              if (snap.hasData &&
+                  snap.data!.exists &&
+                  snap.data!.data() != null) {
+                final data =
+                    snap.data!.data() as Map<String, dynamic>? ?? {};
+                avatarUrl = data['avatarUrl'] as String?;
+                final p = (data['pseudo'] ?? '').toString().trim();
+                final e = (data['email'] ?? '').toString().trim();
+                if (p.isNotEmpty) {
+                  displayName = p;
+                } else if (e.isNotEmpty) {
+                  displayName = e;
+                }
+              }
+              if (displayName.isEmpty) {
+                displayName = 'Joueur';
+              }
+
+              return Row(
+                children: [
+                  GestureDetector(
+                    onTap: () => _openProfile(context),
+                    child: CircleAvatar(
                       radius: 28,
-                      backgroundColor: NeonTheme.surface2.withValues(alpha: 0.8),
-                      backgroundImage:
-                          avatarUrl != null ? NetworkImage(avatarUrl) : null,
-                      child: avatarUrl == null
-                          ? const Icon(Icons.person, size: 32, color: Colors.white70)
+                      backgroundColor:
+                          NeonTheme.surface2.withValues(alpha: 0.8),
+                      backgroundImage: avatarUrl != null
+                          ? NetworkImage(avatarUrl)
                           : null,
-                    );
-                  },
-                ),
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    GestureDetector(
-                      onTap: () {
-                        final currentUid = FirebaseAuth.instance.currentUser?.uid;
-                        if (otherId == currentUid) {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => const UserProfileScreen(),
-                            ),
-                          );
-                        } else {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => PublicProfileScreen(userId: otherId),
-                            ),
-                          );
-                        }
-                      },
-                      child: Text(
-                        otherName,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.w700,
-                          fontSize: 17,
-                          color: Colors.white,
-                        ),
-                      ),
+                      child: avatarUrl == null
+                          ? const Icon(Icons.person,
+                              size: 32, color: Colors.white70)
+                          : null,
                     ),
-                    if (lastMessage.isNotEmpty) ...[
-                      const SizedBox(height: 4),
-                      Text(
-                        lastMessage,
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: Colors.white.withValues(alpha: 0.75),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        GestureDetector(
+                          onTap: () => _openProfile(context),
+                          child: Text(
+                            displayName,
+                            style: TextStyle(
+                              fontWeight: FontWeight.w800,
+                              fontSize: 16,
+                              color: NeonTheme.neonBlue,
+                              shadows: [
+                                Shadow(
+                                  color: NeonTheme.neonBlue.withValues(alpha: 0.35),
+                                  blurRadius: 8,
+                                ),
+                              ],
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              Icon(
-                Icons.chevron_right,
-                color: NeonTheme.neonBlue.withValues(alpha: 0.8),
-                size: 24,
-              ),
-            ],
+                        if (lastMessage.isNotEmpty) ...[
+                          const SizedBox(height: 6),
+                          Text(
+                            lastMessage,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color:
+                                  Colors.white.withValues(alpha: 0.72),
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  Icon(
+                    Icons.chevron_right,
+                    color: NeonTheme.neonBlue.withValues(alpha: 0.8),
+                    size: 24,
+                  ),
+                ],
+              );
+            },
           ),
         ),
       ),
