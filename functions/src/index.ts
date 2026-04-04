@@ -137,11 +137,18 @@ export const sendVerificationEmail = functions.https.onCall(async (data, context
   return { ok: true };
 });
 
+function normalizeVerificationCode(
+  raw: string | number | undefined | null,
+): string {
+  if (raw === undefined || raw === null) return "";
+  return String(raw).replace(/\D/g, "");
+}
+
 export const verifyEmailCode = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Non authentifié.");
   }
-  const code = (data?.code as string | undefined)?.trim();
+  const code = normalizeVerificationCode(data?.code as string | undefined);
   if (!code) {
     throw new functions.https.HttpsError("invalid-argument", "code requis");
   }
@@ -153,7 +160,7 @@ export const verifyEmailCode = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("not-found", "Profil introuvable");
   }
   const u = snap.data() as any;
-  const stored = (u?.verificationCode as string | undefined) ?? "";
+  const stored = normalizeVerificationCode(u?.verificationCode);
   if (!stored || stored !== code) {
     throw new functions.https.HttpsError("permission-denied", "Code incorrect");
   }
@@ -169,79 +176,11 @@ export const verifyEmailCode = functions.https.onCall(async (data, context) => {
   return { ok: true };
 });
 
+// Les signalements sont consultés dans l’app (Menu admin → Signalements).
 export const onReportCreated = functions.firestore
   .document("reports/{reportId}")
-  .onCreate(async (snap, context) => {
-    const data = snap.data() as any;
-    let webhookUrl: string | undefined;
-    try {
-      const config = (functions as any).config?.() ?? {};
-      webhookUrl = config.discord?.reports_webhook as string | undefined;
-    } catch {
-      webhookUrl = undefined;
-    }
-    if (!webhookUrl) {
-      console.warn("Missing discord.reports_webhook config");
-      return;
-    }
-
-    const type = (data.type as string | undefined) ?? "inconnu";
-    const reporter = (data.reporterName as string | undefined) ??
-      (data.reporterId as string | undefined) ??
-      "Inconnu";
-    const reported = (data.reportedUserName as string | undefined) ??
-      (data.reportedUserId as string | undefined) ??
-      "Inconnu";
-    const reason = (data.reason as string | undefined) ?? "Non précisée";
-
-    const fields: any[] = [
-      { name: "Type", value: type, inline: true },
-      { name: "Signalé", value: reported, inline: true },
-      { name: "Par", value: reporter, inline: true },
-      { name: "Raison", value: reason, inline: false },
-    ];
-
-    if (data.postId) {
-      fields.push({ name: "Post ID", value: String(data.postId), inline: true });
-    }
-    if (data.commentId) {
-      fields.push({ name: "Comment ID", value: String(data.commentId), inline: true });
-    }
-    if (data.messageId) {
-      fields.push({ name: "Message ID", value: String(data.messageId), inline: true });
-    }
-    if (data.roomId) {
-      fields.push({ name: "Room / Conv", value: String(data.roomId), inline: true });
-    }
-    if (data.mediaUrl) {
-      fields.push({ name: "Media", value: String(data.mediaUrl), inline: false });
-    }
-
-    const payload = {
-      username: "LD Connect – Modération",
-      embeds: [
-        {
-          title: "Nouveau report",
-          color: 0xff5555,
-          fields,
-          timestamp: new Date().toISOString(),
-        },
-      ],
-    };
-
-    try {
-      const res = await fetch(webhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        console.error("Discord webhook failed:", res.status, text);
-      }
-    } catch (e) {
-      console.error("Discord webhook error:", e);
-    }
+  .onCreate(async () => {
+    return;
   });
 
 export const onBanCreated = functions.firestore
@@ -437,66 +376,10 @@ export const onBanUpdated = functions.firestore
     }
   });
 
+// Les bugs sont consultés dans l’app (Menu admin → Bugs signalés).
 export const onBugReportCreated = functions.firestore
   .document("bug_reports/{bugId}")
-  .onCreate(async (snap, context) => {
-    const data = snap.data() as any;
-
-    let webhookUrl: string | undefined;
-    try {
-      const config = (functions as any).config?.() ?? {};
-      webhookUrl = config.discord?.bugs_webhook as string | undefined;
-    } catch {
-      webhookUrl = undefined;
-    }
-    if (!webhookUrl) {
-      console.warn("Missing discord.bugs_webhook config");
-      return;
-    }
-
-    const description =
-      (data.description as string | undefined) ?? "Aucune description";
-    const userId = (data.userId as string | undefined) ?? "Inconnu";
-    const userPseudo = (data.userPseudo as string | undefined) ?? userId;
-    const platform = (data.platform as string | undefined) ?? "Inconnue";
-    const appVersion = (data.appVersion as string | undefined) ?? "Inconnue";
-
-    const createdAtDate =
-      (data.createdAt as admin.firestore.Timestamp | undefined)?.toDate?.() ??
-      new Date();
-
-    const fields: any[] = [
-      { name: "Utilisateur", value: userPseudo, inline: true },
-      { name: "UID", value: userId, inline: true },
-      { name: "Plateforme", value: platform, inline: true },
-      { name: "Version app", value: appVersion, inline: true },
-      { name: "Description du bug", value: description, inline: false },
-    ];
-
-    const payload = {
-      username: "LD Connect BUG",
-      embeds: [
-        {
-          title: "Nouveau bug signalé",
-          color: 0x00bcd4,
-          fields,
-          timestamp: createdAtDate.toISOString(),
-        },
-      ],
-    };
-
-    try {
-      const res = await fetch(webhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        console.error("Discord bugs webhook failed:", res.status, text);
-      }
-    } catch (e) {
-      console.error("Discord bugs webhook error:", e);
-    }
+  .onCreate(async () => {
+    return;
   });
 

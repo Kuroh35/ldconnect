@@ -6,6 +6,7 @@ import 'dart:ui';
 
 import 'package:image/image.dart' as img;
 import 'package:image_cropper/image_cropper.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_functions/cloud_functions.dart';
@@ -1110,6 +1111,16 @@ class VerificationCodeScreen extends StatelessWidget {
                   const SizedBox(height: 20),
                   TextField(
                     controller: inputCtrl,
+                    keyboardType: TextInputType.number,
+                    maxLength: 6,
+                    textInputAction: TextInputAction.done,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                    ],
+                    decoration: const InputDecoration(
+                      counterText: '',
+                      hintText: '000000',
+                    ),
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       fontSize: 30,
@@ -1120,8 +1131,16 @@ class VerificationCodeScreen extends StatelessWidget {
                   const SizedBox(height: 30),
                   ElevatedButton(
                     onPressed: () async {
-                      final code = inputCtrl.text.trim();
-                      if (code.isEmpty) return;
+                      final code =
+                          inputCtrl.text.replaceAll(RegExp(r'\D'), '');
+                      if (code.length != 6) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Entre les 6 chiffres du code.'),
+                          ),
+                        );
+                        return;
+                      }
                       try {
                         final callable = FirebaseFunctions.instance
                             .httpsCallable('verifyEmailCode');
@@ -1134,10 +1153,15 @@ class VerificationCodeScreen extends StatelessWidget {
                             builder: (context) => const SetupProfileScreen(),
                           ),
                         );
-                      } catch (_) {
+                      } catch (e) {
                         if (!context.mounted) return;
+                        final s = e.toString();
+                        final short = s.contains('permission-denied') ||
+                                s.contains('Code incorrect')
+                            ? 'Code incorrect'
+                            : s;
                         ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text("Code incorrect")),
+                          SnackBar(content: Text(short)),
                         );
                       }
                     },
@@ -2035,8 +2059,11 @@ class SettingsScreen extends StatelessWidget {
                     'userId': uid,
                     'userPseudo': pseudo,
                     'description': desc,
-                    'platform': 'android',
+                    'platform': !kIsWeb && Platform.isIOS
+                        ? 'ios'
+                        : (!kIsWeb && Platform.isAndroid ? 'android' : 'other'),
                     'appVersion': '1.0.0',
+                    'resolved': false,
                     'createdAt': FieldValue.serverTimestamp(),
                   });
 
@@ -2398,9 +2425,496 @@ class AdminMenuScreen extends StatelessWidget {
                     ),
                   ),
                 ),
+                const SizedBox(height: 12),
+                _NeonCard(
+                  child: InkWell(
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const BugReportsAdminScreen(),
+                      ),
+                    ),
+                    borderRadius: BorderRadius.circular(18),
+                    child: const ListTile(
+                      leading: Icon(Icons.bug_report, color: Colors.white),
+                      title: Text("Bugs signalés"),
+                      subtitle: Text(
+                        "Voir les retours utilisateurs et marquer comme résolus",
+                        style: TextStyle(color: Colors.white70),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _NeonCard(
+                  child: InkWell(
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const UserReportsAdminScreen(),
+                      ),
+                    ),
+                    borderRadius: BorderRadius.circular(18),
+                    child: const ListTile(
+                      leading: Icon(Icons.flag_outlined, color: Colors.white),
+                      title: Text("Signalements"),
+                      subtitle: Text(
+                        "Modération des reports (profil, posts, etc.)",
+                        style: TextStyle(color: Colors.white70),
+                      ),
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class BugReportsAdminScreen extends StatelessWidget {
+  const BugReportsAdminScreen({super.key});
+
+  static bool _isResolved(Map<String, dynamic> data) {
+    final v = data['resolved'];
+    if (v is bool) return v;
+    return false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: NeonTheme.bgDark,
+        title: const Text("Bugs signalés"),
+      ),
+      body: Container(
+        decoration: NeonTheme.galaxyBgConnected(),
+        child: StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('bug_reports')
+              .orderBy('createdAt', descending: true)
+              .limit(200)
+              .snapshots(),
+          builder: (context, snap) {
+            if (snap.hasError) {
+              return Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    "Erreur: ${snap.error}",
+                    style: const TextStyle(color: Colors.white70),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              );
+            }
+            if (!snap.hasData) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final docs = snap.data!.docs.toList();
+            docs.sort((a, b) {
+              final da = a.data() as Map<String, dynamic>;
+              final db = b.data() as Map<String, dynamic>;
+              final ra = _isResolved(da);
+              final rb = _isResolved(db);
+              if (ra != rb) return ra ? 1 : -1;
+              return 0;
+            });
+            if (docs.isEmpty) {
+              return const Center(
+                child: Text(
+                  "Aucun bug signalé.",
+                  style: TextStyle(color: Colors.white70),
+                ),
+              );
+            }
+            return ListView.separated(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+              itemCount: docs.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (context, index) {
+                final doc = docs[index];
+                final data = doc.data() as Map<String, dynamic>;
+                final resolved = _isResolved(data);
+                final desc = (data['description'] ?? '').toString();
+                final pseudo = (data['userPseudo'] ?? '?').toString();
+                final uid = (data['userId'] ?? '').toString();
+                final platform = (data['platform'] ?? '?').toString();
+                final ver = (data['appVersion'] ?? '?').toString();
+                final ts = data['createdAt'] as Timestamp?;
+                final dateStr = ts != null
+                    ? DateFormat('dd/MM/yyyy HH:mm').format(ts.toDate())
+                    : '';
+                return _NeonCard(
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                pseudo,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 16,
+                                ),
+                              ),
+                            ),
+                            if (resolved)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.green.withValues(alpha: 0.25),
+                                  borderRadius: BorderRadius.circular(20),
+                                  border: Border.all(color: Colors.greenAccent),
+                                ),
+                                child: const Text(
+                                  "Résolu",
+                                  style: TextStyle(
+                                    color: Colors.greenAccent,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          "UID: $uid",
+                          style: const TextStyle(
+                            color: Colors.white38,
+                            fontSize: 11,
+                          ),
+                        ),
+                        Text(
+                          "$platform • v$ver • $dateStr",
+                          style: const TextStyle(
+                            color: Colors.white54,
+                            fontSize: 12,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          desc.isEmpty ? "(pas de description)" : desc,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 14,
+                          ),
+                        ),
+                        if (!resolved) ...[
+                          const SizedBox(height: 12),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton.icon(
+                              onPressed: () async {
+                                final ok = await showDialog<bool>(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text("Marquer comme résolu"),
+                                    content: const Text(
+                                      "Ce bug sera marqué comme traité.",
+                                    ),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () =>
+                                            Navigator.pop(ctx, false),
+                                        child: const Text("Annuler"),
+                                      ),
+                                      TextButton(
+                                        onPressed: () =>
+                                            Navigator.pop(ctx, true),
+                                        child: const Text(
+                                          "Confirmer",
+                                          style: TextStyle(
+                                            color: Colors.greenAccent,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                                if (ok != true) return;
+                                try {
+                                  await FirebaseFirestore.instance
+                                      .collection('bug_reports')
+                                      .doc(doc.id)
+                                      .update({
+                                    'resolved': true,
+                                    'resolvedAt':
+                                        FieldValue.serverTimestamp(),
+                                    'resolvedBy': FirebaseAuth
+                                        .instance.currentUser?.uid,
+                                  });
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context)
+                                        .showSnackBar(
+                                      const SnackBar(
+                                        content: Text("Bug marqué résolu."),
+                                      ),
+                                    );
+                                  }
+                                } catch (e) {
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text("Erreur: $e"),
+                                      ),
+                                    );
+                                  }
+                                }
+                              },
+                              icon: const Icon(
+                                Icons.check_circle_outline,
+                                color: NeonTheme.neonBlue,
+                              ),
+                              label: const Text(
+                                "Résolu",
+                                style: TextStyle(color: NeonTheme.neonBlue),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                );
+              },
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class UserReportsAdminScreen extends StatelessWidget {
+  const UserReportsAdminScreen({super.key});
+
+  static bool _isResolved(Map<String, dynamic> data) {
+    final v = data['resolved'];
+    if (v is bool) return v;
+    return false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: NeonTheme.bgDark,
+        title: const Text("Signalements"),
+      ),
+      body: Container(
+        decoration: NeonTheme.galaxyBgConnected(),
+        child: StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection('reports')
+              .orderBy('createdAt', descending: true)
+              .limit(200)
+              .snapshots(),
+          builder: (context, snap) {
+            if (snap.hasError) {
+              return Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    "Erreur: ${snap.error}",
+                    style: const TextStyle(color: Colors.white70),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              );
+            }
+            if (!snap.hasData) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final docs = snap.data!.docs.toList();
+            docs.sort((a, b) {
+              final da = a.data() as Map<String, dynamic>;
+              final db = b.data() as Map<String, dynamic>;
+              final ra = _isResolved(da);
+              final rb = _isResolved(db);
+              if (ra != rb) return ra ? 1 : -1;
+              return 0;
+            });
+            if (docs.isEmpty) {
+              return const Center(
+                child: Text(
+                  "Aucun signalement.",
+                  style: TextStyle(color: Colors.white70),
+                ),
+              );
+            }
+            return ListView.separated(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+              itemCount: docs.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (context, index) {
+                final doc = docs[index];
+                final data = doc.data() as Map<String, dynamic>;
+                final resolved = _isResolved(data);
+                final type = (data['type'] ?? '?').toString();
+                final reason = (data['reason'] ?? '').toString();
+                final reporter = (data['reporterName'] ?? '?').toString();
+                final reported = (data['reportedUserName'] ?? '?').toString();
+                final ts = data['createdAt'] as Timestamp?;
+                final dateStr = ts != null
+                    ? DateFormat('dd/MM/yyyy HH:mm').format(ts.toDate())
+                    : '';
+                return _NeonCard(
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                type,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 16,
+                                ),
+                              ),
+                            ),
+                            if (resolved)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.green.withValues(alpha: 0.25),
+                                  borderRadius: BorderRadius.circular(20),
+                                  border: Border.all(color: Colors.greenAccent),
+                                ),
+                                child: const Text(
+                                  "Résolu",
+                                  style: TextStyle(
+                                    color: Colors.greenAccent,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          "Par: $reporter → $reported",
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 13,
+                          ),
+                        ),
+                        Text(
+                          dateStr,
+                          style: const TextStyle(
+                            color: Colors.white38,
+                            fontSize: 11,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          reason.isEmpty ? "(pas de détail)" : reason,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 14,
+                          ),
+                        ),
+                        if (!resolved) ...[
+                          const SizedBox(height: 12),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton.icon(
+                              onPressed: () async {
+                                final ok = await showDialog<bool>(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text("Marquer comme résolu"),
+                                    content: const Text(
+                                      "Ce signalement sera marqué comme traité.",
+                                    ),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () =>
+                                            Navigator.pop(ctx, false),
+                                        child: const Text("Annuler"),
+                                      ),
+                                      TextButton(
+                                        onPressed: () =>
+                                            Navigator.pop(ctx, true),
+                                        child: const Text(
+                                          "Confirmer",
+                                          style: TextStyle(
+                                            color: Colors.greenAccent,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                                if (ok != true) return;
+                                try {
+                                  await FirebaseFirestore.instance
+                                      .collection('reports')
+                                      .doc(doc.id)
+                                      .update({
+                                    'resolved': true,
+                                    'resolvedAt':
+                                        FieldValue.serverTimestamp(),
+                                    'resolvedBy': FirebaseAuth
+                                        .instance.currentUser?.uid,
+                                  });
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context)
+                                        .showSnackBar(
+                                      const SnackBar(
+                                        content: Text(
+                                          "Signalement marqué résolu.",
+                                        ),
+                                      ),
+                                    );
+                                  }
+                                } catch (e) {
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text("Erreur: $e"),
+                                      ),
+                                    );
+                                  }
+                                }
+                              },
+                              icon: const Icon(
+                                Icons.check_circle_outline,
+                                color: NeonTheme.neonBlue,
+                              ),
+                              label: const Text(
+                                "Résolu",
+                                style: TextStyle(color: NeonTheme.neonBlue),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                );
+              },
+            );
+          },
         ),
       ),
     );
@@ -3574,6 +4088,7 @@ Future<void> openReportDialog({
     'roomId': roomId,
     'mediaUrl': mediaUrl,
     'reason': reason,
+    'resolved': false,
     'createdAt': FieldValue.serverTimestamp(),
   });
 
