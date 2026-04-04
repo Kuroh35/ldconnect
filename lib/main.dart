@@ -23,6 +23,11 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
+/// Même région que les Cloud Functions dans la console Firebase (souvent us-central1).
+/// Sinon l’app peut renvoyer `firebase_functions/not-found` sur iOS/Android.
+final FirebaseFunctions _firebaseFunctionsRegion =
+    FirebaseFunctions.instanceFor(region: 'us-central1');
+
 const AndroidNotificationChannel _defaultNotificationChannel =
     AndroidNotificationChannel(
   'ldconnect_high_importance',
@@ -50,13 +55,24 @@ Future<File?> pickAndCropImage(
         toolbarTitle: circular ? "Recadrer la photo" : "Recadrer la bannière",
         toolbarColor: const Color(0xFF1E1C33),
         toolbarWidgetColor: Colors.white,
+        backgroundColor: const Color(0xFF030315),
+        dimmedLayerColor: Colors.black54,
+        statusBarLight: false,
+        navBarLight: false,
         cropStyle: circular ? CropStyle.circle : CropStyle.rectangle,
         lockAspectRatio: true,
+        hideBottomControls: false,
+        showCropGrid: true,
       ),
       IOSUiSettings(
         title: circular ? "Recadrer la photo" : "Recadrer la bannière",
         cropStyle: circular ? CropStyle.circle : CropStyle.rectangle,
         aspectRatioLockEnabled: true,
+        resetAspectRatioEnabled: false,
+        rotateButtonsHidden: false,
+        aspectRatioPickerButtonHidden: true,
+        embedInNavigationController: true,
+        hidesNavigationBar: false,
       ),
     ],
     compressQuality: 85,
@@ -125,6 +141,7 @@ void _firebaseOnMessageHandler(RemoteMessage message) {
         icon: '@mipmap/ic_launcher',
       ),
     ),
+    payload: jsonEncode(message.data),
   );
 }
 
@@ -233,7 +250,23 @@ Future<void> _setupMessagingAndNotifications() async {
       android: androidInit,
       iOS: iosInit,
     );
-    await flutterLocalNotificationsPlugin.initialize(settings: initSettings);
+    await flutterLocalNotificationsPlugin.initialize(
+      settings: initSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse response) {
+        final p = response.payload;
+        if (p == null || p.isEmpty) return;
+        try {
+          final decoded = jsonDecode(p);
+          if (decoded is Map) {
+            navigateFromNotificationData(
+              Map<String, dynamic>.from(
+                decoded.map((k, v) => MapEntry(k.toString(), v)),
+              ),
+            );
+          }
+        } catch (_) {}
+      },
+    );
     await flutterLocalNotificationsPlugin
         .resolvePlatformSpecificImplementation<
             AndroidFlutterLocalNotificationsPlugin>()
@@ -254,6 +287,14 @@ Future<void> _setupMessagingAndNotifications() async {
     });
 
     FirebaseMessaging.onMessage.listen(_firebaseOnMessageHandler);
+
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage msg) {
+      navigateFromNotificationData(msg.data);
+    });
+    final initialMsg = await FirebaseMessaging.instance.getInitialMessage();
+    if (initialMsg != null) {
+      navigateFromNotificationData(initialMsg.data);
+    }
   } catch (e, st) {
     debugPrint('FCM / notifications init failed: $e\n$st');
   }
@@ -410,11 +451,118 @@ String? _rankAssetFromRank(String rank) {
   return null;
 }
 
+/// Navigation globale (notifications FCM / tap sur une notif).
+final GlobalKey<NavigatorState> rootNavigatorKey = GlobalKey<NavigatorState>();
+
+Future<void> _globalNotificationRelay({
+  required String targetUid,
+  required String type,
+  required String message,
+  required String postId,
+  String? commentId,
+}) async {
+  final currentUid = FirebaseAuth.instance.currentUser?.uid;
+  if (currentUid == null || currentUid == targetUid) return;
+  final currentUserSnap =
+      await FirebaseFirestore.instance.collection('users').doc(currentUid).get();
+  final currentUserData = currentUserSnap.data() ?? <String, dynamic>{};
+  final fromName = (currentUserData['pseudo'] ??
+          currentUserData['email'] ??
+          'Quelqu\'un')
+      .toString();
+  final fullMessage = '$fromName $message';
+  await FirebaseFirestore.instance
+      .collection('users')
+      .doc(targetUid)
+      .collection('notifications')
+      .add({
+    'type': type,
+    'message': fullMessage,
+    'postId': postId,
+    'commentId': commentId,
+    'fromUserId': currentUid,
+    'fromUserName': fromName,
+    'timestamp': FieldValue.serverTimestamp(),
+    'read': false,
+  });
+}
+
+/// Ouvre le fil / profil selon les données FCM ou le centre de notifications.
+void navigateFromNotificationData(Map<String, dynamic> raw) {
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    final postId = (raw['postId'] ?? '').toString().trim();
+    final fromUserId = (raw['fromUserId'] ?? '').toString().trim();
+
+    if (postId.isNotEmpty) {
+      final snap =
+          await FirebaseFirestore.instance.collection('posts').doc(postId).get();
+      if (!snap.exists) return;
+      final d = snap.data() as Map<String, dynamic>;
+      final authorId = (d['authorId'] ?? '').toString();
+      final ctx = rootNavigatorKey.currentContext;
+      if (ctx == null || !ctx.mounted) return;
+      await showModalBottomSheet<void>(
+        context: ctx,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        builder: (sheetCtx) => CommentsSheet(
+          postId: postId,
+          postAuthorId: authorId,
+          onNotify: _globalNotificationRelay,
+        ),
+      );
+    } else if (fromUserId.isNotEmpty) {
+      final ctx = rootNavigatorKey.currentContext;
+      if (ctx == null || !ctx.mounted) return;
+      await Navigator.of(ctx).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => PublicProfileScreen(userId: fromUserId),
+        ),
+      );
+    }
+  });
+}
+
+void openFullscreenImageUrl(BuildContext context, String url) {
+  Navigator.of(context).push<void>(
+    PageRouteBuilder<void>(
+      opaque: false,
+      barrierColor: Colors.black87,
+      pageBuilder: (ctx, _, __) => Scaffold(
+        backgroundColor: Colors.transparent,
+        body: SafeArea(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Center(
+                child: InteractiveViewer(
+                  minScale: 0.5,
+                  maxScale: 5,
+                  child: Image.network(url),
+                ),
+              ),
+              Positioned(
+                top: 4,
+                right: 4,
+                child: IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white, size: 28),
+                  onPressed: () => Navigator.of(ctx).pop(),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 class LDConnectApp extends StatelessWidget {
   const LDConnectApp({super.key});
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: rootNavigatorKey,
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: NeonTheme.bgDark,
@@ -604,6 +752,7 @@ class _AuthScreenState extends State<AuthScreen>
     with SingleTickerProviderStateMixin {
   final TextEditingController _email = TextEditingController();
   final TextEditingController _pass = TextEditingController();
+  final TextEditingController _passConfirm = TextEditingController();
   bool isLogin = true;
   bool isLoading = false;
   bool rememberMe = false;
@@ -629,6 +778,7 @@ class _AuthScreenState extends State<AuthScreen>
     _logoAnimController.dispose();
     _email.dispose();
     _pass.dispose();
+    _passConfirm.dispose();
     super.dispose();
   }
 
@@ -659,6 +809,14 @@ class _AuthScreenState extends State<AuthScreen>
       return;
     }
     if (_email.text.isEmpty || _pass.text.length < 6) return;
+    if (!isLogin && _pass.text != _passConfirm.text) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Les mots de passe ne correspondent pas."),
+        ),
+      );
+      return;
+    }
     setState(() => isLoading = true);
     UserCredential? userCredential;
     try {
@@ -842,8 +1000,8 @@ class _AuthScreenState extends State<AuthScreen>
               password: _pass.text.trim(),
             );
 
-        final callable =
-            FirebaseFunctions.instance.httpsCallable('sendVerificationEmail');
+        final callable = _firebaseFunctionsRegion
+            .httpsCallable('sendVerificationEmail');
         await callable.call({
           'email': _email.text.trim(),
           'code': code,
@@ -965,6 +1123,17 @@ class _AuthScreenState extends State<AuthScreen>
                     icon: Icons.lock,
                   ),
                 ),
+                if (!isLogin) ...[
+                  const SizedBox(height: 15),
+                  TextField(
+                    controller: _passConfirm,
+                    obscureText: true,
+                    decoration: NeonTheme.inputStyle(
+                      "Confirmer le mot de passe",
+                      icon: Icons.lock_outline,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 8),
                 Row(
                   children: [
@@ -1142,7 +1311,7 @@ class VerificationCodeScreen extends StatelessWidget {
                         return;
                       }
                       try {
-                        final callable = FirebaseFunctions.instance
+                        final callable = _firebaseFunctionsRegion
                             .httpsCallable('verifyEmailCode');
                         await callable.call({'code': code});
 
@@ -1171,13 +1340,8 @@ class VerificationCodeScreen extends StatelessWidget {
                   TextButton(
                     onPressed: () async {
                       await FirebaseAuth.instance.signOut();
-                      if (!context.mounted) return;
-                      Navigator.pushAndRemoveUntil(
-                        context,
-                        MaterialPageRoute(
-                            builder: (_) => const AuthScreen()),
-                        (route) => false,
-                      );
+                      rootNavigatorKey.currentState
+                          ?.popUntil((route) => route.isFirst);
                     },
                     child: const Text(
                       "Changer de compte / Se déconnecter",
@@ -2144,11 +2308,8 @@ class SettingsScreen extends StatelessWidget {
             child: InkWell(
               onTap: () async {
                 await FirebaseAuth.instance.signOut();
-                if (!context.mounted) return;
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute(builder: (_) => const AuthScreen()),
-                  (route) => false,
-                );
+                rootNavigatorKey.currentState
+                    ?.popUntil((route) => route.isFirst);
               },
               borderRadius: BorderRadius.circular(18),
               child: Padding(
@@ -4012,12 +4173,7 @@ Future<void> deleteAccountAndData(BuildContext context) async {
 
     await FirebaseAuth.instance.signOut();
 
-    if (context.mounted) {
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const AuthScreen()),
-        (route) => false,
-      );
-    }
+    rootNavigatorKey.currentState?.popUntil((route) => route.isFirst);
   } catch (e) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text("Erreur lors de la suppression: $e")),
@@ -4191,6 +4347,23 @@ class PrivateChatScreen extends StatefulWidget {
 
 class _PrivateChatScreenState extends State<PrivateChatScreen> {
   final TextEditingController _ctrl = TextEditingController();
+  String? _myPseudo;
+  bool _uploadingImage = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid != null) {
+      FirebaseFirestore.instance.collection('users').doc(uid).get().then((s) {
+        if (!mounted) return;
+        final d = s.data();
+        setState(() {
+          _myPseudo = (d?['pseudo'] ?? d?['email'] ?? 'Moi').toString();
+        });
+      });
+    }
+  }
 
   @override
   void dispose() {
@@ -4202,11 +4375,8 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
   Widget build(BuildContext context) {
     final currentUser = FirebaseAuth.instance.currentUser;
     if (currentUser == null) {
-      Future.microtask(() {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const AuthScreen()),
-          (route) => false,
-        );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        rootNavigatorKey.currentState?.popUntil((r) => r.isFirst);
       });
       return const Scaffold(
         body: Center(child: CircularProgressIndicator()),
@@ -4367,9 +4537,13 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
                                     doc.data() as Map<String, dynamic>;
                                 final text =
                                     (data['text'] ?? '').toString();
+                                final imageUrl =
+                                    data['imageUrl'] as String?;
                                 final sender =
                                     (data['senderId'] ?? '').toString();
                                 final isMe = sender == currentUid;
+                                final nameLabel =
+                                    isMe ? (_myPseudo ?? 'Moi') : widget.otherPseudo;
 
                                 return Align(
                                   alignment: isMe
@@ -4389,18 +4563,20 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
                                           ? CrossAxisAlignment.end
                                           : CrossAxisAlignment.start,
                                       children: [
-                                        if (!isMe)
-                                          Padding(
-                                            padding: const EdgeInsets.only(
-                                                left: 4, bottom: 2),
-                                            child: Text(
-                                              widget.otherPseudo,
-                                              style: const TextStyle(
-                                                fontSize: 11,
-                                                color: Colors.white70,
-                                              ),
+                                        Padding(
+                                          padding: EdgeInsets.only(
+                                            left: isMe ? 0 : 4,
+                                            right: isMe ? 4 : 0,
+                                            bottom: 2,
+                                          ),
+                                          child: Text(
+                                            nameLabel,
+                                            style: const TextStyle(
+                                              fontSize: 11,
+                                              color: Colors.white70,
                                             ),
                                           ),
+                                        ),
                                         Container(
                                           padding: const EdgeInsets.symmetric(
                                             horizontal: 12,
@@ -4425,14 +4601,51 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
                                                 ),
                                             ],
                                           ),
-                                          child: Text(
-                                            text,
-                                            style: TextStyle(
-                                              color: isMe
-                                                  ? Colors.black
-                                                  : Colors.white,
-                                              fontSize: 14,
-                                            ),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              if (imageUrl != null &&
+                                                  imageUrl.isNotEmpty)
+                                                GestureDetector(
+                                                  onTap: () =>
+                                                      openFullscreenImageUrl(
+                                                    context,
+                                                    imageUrl,
+                                                  ),
+                                                  child: ClipRRect(
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                            12),
+                                                    child: ConstrainedBox(
+                                                      constraints:
+                                                          const BoxConstraints(
+                                                        maxWidth: 220,
+                                                        maxHeight: 220,
+                                                      ),
+                                                      child: Image.network(
+                                                        imageUrl,
+                                                        fit: BoxFit.cover,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              if (text.isNotEmpty) ...[
+                                                if (imageUrl != null &&
+                                                    imageUrl.isNotEmpty)
+                                                  const SizedBox(height: 6),
+                                                Text(
+                                                  text,
+                                                  style: TextStyle(
+                                                    color: isMe
+                                                        ? Colors.black
+                                                        : Colors.white,
+                                                    fontSize: 14,
+                                                  ),
+                                                ),
+                                              ],
+                                            ],
                                           ),
                                         ),
                                       ],
@@ -4481,10 +4694,27 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
             color: NeonTheme.surface2.withValues(alpha: 0.9),
             child: Row(
               children: [
+                if (_uploadingImage)
+                  const Padding(
+                    padding: EdgeInsets.all(8),
+                    child: SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
+                else
+                  IconButton(
+                    icon: const Icon(Icons.photo_library_outlined),
+                    color: canSend ? NeonTheme.neonBlue : Colors.grey,
+                    onPressed: canSend
+                        ? () => _pickAndSendImage(convoRef, currentUid)
+                        : null,
+                  ),
                 Expanded(
                   child: TextField(
                     controller: _ctrl,
-                    enabled: canSend,
+                    enabled: canSend && !_uploadingImage,
                     decoration: InputDecoration(
                       hintText: canSend
                           ? "Écrire un message..."
@@ -4495,8 +4725,12 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
                 ),
                 IconButton(
                   icon: const Icon(Icons.send),
-                  color: canSend ? NeonTheme.neonBlue : Colors.grey,
-                  onPressed: canSend ? () => _send(convoRef, currentUid) : null,
+                  color: canSend && !_uploadingImage
+                      ? NeonTheme.neonBlue
+                      : Colors.grey,
+                  onPressed: canSend && !_uploadingImage
+                      ? () => _send(convoRef, currentUid)
+                      : null,
                 ),
               ],
             ),
@@ -4528,6 +4762,49 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
 
     // XP pour message privé envoyé
     await _awardXp(currentUid, 1);
+  }
+
+  Future<void> _pickAndSendImage(
+    DocumentReference convoRef,
+    String currentUid,
+  ) async {
+    if (!await _checkUserNotBannedForAction(context)) return;
+    final picked = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 2048,
+      maxHeight: 2048,
+      imageQuality: 88,
+    );
+    if (picked == null || !mounted) return;
+    setState(() => _uploadingImage = true);
+    try {
+      final file = File(picked.path);
+      final ref = FirebaseStorage.instance.ref().child(
+            'conversations/${widget.conversationId}/${DateTime.now().millisecondsSinceEpoch}.jpg',
+          );
+      await ref.putFile(file);
+      final url = await ref.getDownloadURL();
+      final messagesRef = convoRef.collection('messages');
+      await messagesRef.add({
+        'text': '',
+        'imageUrl': url,
+        'senderId': currentUid,
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+      await convoRef.update({
+        'lastMessage': '📷 Photo',
+        'lastMessageAt': FieldValue.serverTimestamp(),
+      });
+      await _awardXp(currentUid, 1);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Envoi de la photo : $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _uploadingImage = false);
+    }
   }
 }
 
@@ -4565,11 +4842,8 @@ class _MatesScreenState extends State<MatesScreen>
   Widget build(BuildContext context) {
     final currentUid = FirebaseAuth.instance.currentUser?.uid;
     if (currentUid == null) {
-      Future.microtask(() {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const AuthScreen()),
-          (route) => false,
-        );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        rootNavigatorKey.currentState?.popUntil((r) => r.isFirst);
       });
       return const Center(child: CircularProgressIndicator());
     }
@@ -6498,11 +6772,8 @@ class _ChatRoomScreenState extends State<ChatRoomScreen> {
   Widget build(BuildContext context) {
     final currentUser = FirebaseAuth.instance.currentUser;
     if (currentUser == null) {
-      Future.microtask(() {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const AuthScreen()),
-          (route) => false,
-        );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        rootNavigatorKey.currentState?.popUntil((r) => r.isFirst);
       });
       return const Scaffold(
         body: Center(child: CircularProgressIndicator()),
@@ -7486,11 +7757,8 @@ class _SocialScreenState extends State<SocialScreen>
   Widget build(BuildContext context) {
     final currentUid = FirebaseAuth.instance.currentUser?.uid;
     if (currentUid == null) {
-      Future.microtask(() {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const AuthScreen()),
-          (route) => false,
-        );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        rootNavigatorKey.currentState?.popUntil((r) => r.isFirst);
       });
       return const Center(child: CircularProgressIndicator());
     }
@@ -8050,6 +8318,26 @@ class CommunityFeedScreen extends StatefulWidget {
 }
 
 class _CommunityFeedScreenState extends State<CommunityFeedScreen> {
+  final ScrollController _feedScroll = ScrollController();
+  bool _showScrollTopFab = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _feedScroll.addListener(() {
+      final show = _feedScroll.hasClients && _feedScroll.offset > 280;
+      if (show != _showScrollTopFab) {
+        setState(() => _showScrollTopFab = show);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _feedScroll.dispose();
+    super.dispose();
+  }
+
   Future<Map<String, dynamic>?> _loadCurrentUser() async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return null;
@@ -8071,11 +8359,8 @@ class _CommunityFeedScreenState extends State<CommunityFeedScreen> {
         final userData = userSnap.data ?? {};
         final currentUid = FirebaseAuth.instance.currentUser?.uid;
         if (currentUid == null) {
-          Future.microtask(() {
-            Navigator.of(context).pushAndRemoveUntil(
-              MaterialPageRoute(builder: (_) => const AuthScreen()),
-              (route) => false,
-            );
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            rootNavigatorKey.currentState?.popUntil((r) => r.isFirst);
           });
           return const Center(child: CircularProgressIndicator());
         }
@@ -8091,8 +8376,10 @@ class _CommunityFeedScreenState extends State<CommunityFeedScreen> {
             banUntilTs != null && banUntilTs.toDate().isAfter(now);
         final bool isBanned = banPermanent || isTempBanned;
 
-        return Column(
+        return Stack(
           children: [
+            Column(
+              children: [
             const SizedBox(height: 40),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 18),
@@ -8286,6 +8573,7 @@ class _CommunityFeedScreenState extends State<CommunityFeedScreen> {
                     );
                       }
                       return ListView.builder(
+                        controller: _feedScroll,
                         itemCount: filtered.length,
                         itemBuilder: (context, i) {
                           final doc = filtered[i];
@@ -8305,6 +8593,38 @@ class _CommunityFeedScreenState extends State<CommunityFeedScreen> {
             },
               ),
             ),
+          ],
+            ),
+            if (_showScrollTopFab)
+              Positioned(
+                right: 12,
+                bottom: 12,
+                child: Material(
+                  color: NeonTheme.surface.withValues(alpha: 0.95),
+                  shape: const CircleBorder(),
+                  elevation: 6,
+                  child: InkWell(
+                    customBorder: const CircleBorder(),
+                    onTap: () {
+                      if (_feedScroll.hasClients) {
+                        _feedScroll.animateTo(
+                          0,
+                          duration: const Duration(milliseconds: 450),
+                          curve: Curves.easeOutCubic,
+                        );
+                      }
+                    },
+                    child: const Padding(
+                      padding: EdgeInsets.all(12),
+                      child: Icon(
+                        Icons.keyboard_arrow_up,
+                        color: Colors.white,
+                        size: 28,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
           ],
         );
       },
@@ -8994,9 +9314,13 @@ class _PostCard extends StatelessWidget {
             ClipRRect(
               borderRadius: BorderRadius.circular(12),
               child: mediaType == 'image'
-                  ? Image.network(
-                      mediaUrl,
-                      fit: BoxFit.cover,
+                  ? GestureDetector(
+                      onTap: () =>
+                          openFullscreenImageUrl(context, mediaUrl),
+                      child: Image.network(
+                        mediaUrl,
+                        fit: BoxFit.cover,
+                      ),
                     )
                   : Container(
                       height: 180,
@@ -10250,6 +10574,10 @@ class NotificationsSheet extends StatelessWidget {
                         ),
                         onTap: () async {
                           await doc.reference.update({'read': true});
+                          if (!context.mounted) return;
+                          final nav = Map<String, dynamic>.from(data);
+                          Navigator.of(context).pop();
+                          navigateFromNotificationData(nav);
                         },
                       ),
                     );
@@ -11105,11 +11433,8 @@ class PublicProfileScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final currentUid = FirebaseAuth.instance.currentUser?.uid;
     if (currentUid == null) {
-      Future.microtask(() {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const AuthScreen()),
-          (route) => false,
-        );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        rootNavigatorKey.currentState?.popUntil((r) => r.isFirst);
       });
       return const Center(child: CircularProgressIndicator());
     }
