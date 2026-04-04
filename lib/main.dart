@@ -8320,20 +8320,27 @@ class CommunityFeedScreen extends StatefulWidget {
 class _CommunityFeedScreenState extends State<CommunityFeedScreen> {
   final ScrollController _feedScroll = ScrollController();
   bool _showScrollTopFab = false;
+  /// Ne pas recréer ce future à chaque build : sinon [FutureBuilder] redémarre
+  /// et la liste perd le scroll (ex. quand le bouton « remonter » appelle setState).
+  late final Future<Map<String, dynamic>?> _userFuture;
 
   @override
   void initState() {
     super.initState();
-    _feedScroll.addListener(() {
-      final show = _feedScroll.hasClients && _feedScroll.offset > 280;
-      if (show != _showScrollTopFab) {
-        setState(() => _showScrollTopFab = show);
-      }
-    });
+    _userFuture = _loadCurrentUser();
+    _feedScroll.addListener(_onFeedScroll);
+  }
+
+  void _onFeedScroll() {
+    final show = _feedScroll.hasClients && _feedScroll.offset > 280;
+    if (show != _showScrollTopFab) {
+      setState(() => _showScrollTopFab = show);
+    }
   }
 
   @override
   void dispose() {
+    _feedScroll.removeListener(_onFeedScroll);
     _feedScroll.dispose();
     super.dispose();
   }
@@ -8351,7 +8358,7 @@ class _CommunityFeedScreenState extends State<CommunityFeedScreen> {
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<Map<String, dynamic>?>(
-      future: _loadCurrentUser(),
+      future: _userFuture,
       builder: (context, userSnap) {
         if (userSnap.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
